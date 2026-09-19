@@ -6,6 +6,7 @@ using SubrosaServerEmulator.Master.Data;
 using SubrosaServerEmulator.Master.Exceptions;
 using SubrosaServerEmulator.Master.IO;
 using SubrosaServerEmulator.Master.Packets;
+using Microsoft.Data.Sqlite;
 
 namespace SubrosaServerEmulator.Master;
 public class MasterServer : LogSource, IDisposable
@@ -168,27 +169,83 @@ public class MasterServer : LogSource, IDisposable
     }
     void OnClientAuth(ClientAuthReqPacket req, EndPoint remote)
     {
-        /*
-         * TODO: WARNING
-         * This is probably not a safe way to check if an user already exists
-         * If two users with the same name try to connect, it may generate problems!
-         */
+        User user;
 
-        if (!_userNameMap.TryGetValue(req.Username, out var user))
+        using var transaction = _db.BeginTransaction();
+
+        using (var cmd = _db.CreateCommand())
         {
-            var biggest = _userNameMap.LastOrDefault().Value?.RegistrationId ?? 0;
-            user = new()
+            cmd.Transaction = transaction;
+            cmd.CommandText = """
+                              SELECT registration_id, registration_seq
+                              FROM users
+                              WHERE username = $username;
+                              """;
+
+            cmd.Parameters.AddWithValue("$username", req.Username);
+
+            using var reader = cmd.ExecuteReader();
+
+            if (reader.Read())
             {
-                Username = req.Username,
-                RegistrationId = biggest + 1,
-                RegistrationSeq = biggest + 1
-            };
-            
-            _userNameMap.Add(user.Username, user);
-            _userIdMap[user.RegistrationId] = user;
-            
-            Info($"Registered new client \"{user.Username}\" (ID: {user.RegistrationId}, {user.RegistrationSeq})");
+                user = new User
+                {
+                    Username = req.Username,
+                    RegistrationId = reader.GetInt32(0),
+                    RegistrationSeq = reader.GetInt32(1)
+                };
+
+                Debug($"Loaded client \"{user.Username}\" " +
+                      $"(ID: {user.RegistrationId}, {user.RegistrationSeq})");
+            }
+            else
+            {
+                reader.Close();
+
+                int id;
+
+                using (var idCmd = _db.CreateCommand())
+                {
+                    idCmd.Transaction = transaction;
+                    idCmd.CommandText = """
+                                        SELECT COALESCE(MAX(registration_id), 0) + 1
+                                        FROM users;
+                                        """;
+
+                    id = Convert.ToInt32(idCmd.ExecuteScalar());
+                }
+
+                user = new User
+                {
+                    Username = req.Username,
+                    RegistrationId = id,
+                    RegistrationSeq = id
+                };
+
+                using var insert = _db.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                                     INSERT INTO users
+                                         (username, registration_id, registration_seq)
+                                     VALUES
+                                         ($username, $id, $seq);
+                                     """;
+
+                insert.Parameters.AddWithValue("$username", user.Username);
+                insert.Parameters.AddWithValue("$id", user.RegistrationId);
+                insert.Parameters.AddWithValue("$seq", user.RegistrationSeq);
+
+                insert.ExecuteNonQuery();
+
+                Info($"Registered new client \"{user.Username}\" " +
+                     $"(ID: {user.RegistrationId}, {user.RegistrationSeq})");
+            }
         }
+
+        transaction.Commit();
+
+        _userNameMap[user.Username] = user;
+        _userIdMap[user.RegistrationId] = user;
 
         SendPacket(new ClientAuthResPacket
         {
@@ -260,12 +317,30 @@ public class MasterServer : LogSource, IDisposable
         pck.Write(stream);
         Socket.SendTo(stream.ToArray(), remote);
     }
+
+    void InitDB()
+    {
+        _db.Open();
+
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = """
+                          CREATE TABLE IF NOT EXISTS users (
+                              username TEXT PRIMARY KEY,
+                              registration_id INTEGER NOT NULL UNIQUE,
+                              registration_seq INTEGER NOT NULL
+                          );
+                          """;
+
+        cmd.ExecuteNonQuery();
+    }
     
     public MasterServer()
     {
         AsyncArgs.Completed += OnReceivePacket;
         AsyncArgs.RemoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
         AsyncArgs.SetBuffer(new byte[1024], 0, 1024);
+
+        InitDB();
     }
 
     public bool IsRunning { get; private set; }
@@ -282,6 +357,7 @@ public class MasterServer : LogSource, IDisposable
 
     private readonly Dictionary<string, User> _userNameMap = new();
     private readonly Dictionary<int, User> _userIdMap = new();
+    readonly SqliteConnection _db = new("Data Source=master.db");
     
     private SocketAsyncEventArgs AsyncArgs { get; } = new();
     private CancellationTokenSource? _cts;

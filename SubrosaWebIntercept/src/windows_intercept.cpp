@@ -182,6 +182,30 @@ extern "C" int hooked_connect(
 
 extern "C" hostent *hooked_gethostbyname(const char *name)
 {
+    if (name && strcmp(name, "ms.jpxs.io") == 0)
+    {
+        printf("[hook] detected dns query, "
+               "redirecting to %s\n",
+               g_ip.c_str());
+
+        static in_addr addr;
+        static char *addr_list[2];
+        static hostent result;
+
+        addr.s_addr = inet_addr("YOUR.VPS.IP");
+
+        addr_list[0] = reinterpret_cast<char *>(&addr);
+        addr_list[1] = nullptr;
+
+        result.h_name = const_cast<char *>("ms.jpxs.io");
+        result.h_aliases = nullptr;
+        result.h_addrtype = AF_INET;
+        result.h_length = sizeof(addr);
+        result.h_addr_list = addr_list;
+
+        return &result;
+    }
+
     return gethostbyname(name);
 }
 

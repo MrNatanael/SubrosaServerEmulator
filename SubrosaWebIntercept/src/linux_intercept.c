@@ -4,12 +4,15 @@
 #include <string>
 #include <filesystem>
 #include <cstdio>
+#include <cstring>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 static std::string g_ip = "127.0.0.1";
 static unsigned short g_port = 80;
 
 using connect_fn = int (*)(int, const sockaddr *, socklen_t);
+using gethostbyname_fn = hostent *(*)(const char *);
 
 extern "C" int connect(int sockfd, const sockaddr *addr, socklen_t addrlen)
 {
@@ -33,9 +36,9 @@ extern "C" int connect(int sockfd, const sockaddr *addr, socklen_t addrlen)
             printf("[hook] detected connection to http port, redirecting to %s:%u\n", g_ip.c_str(), g_port);
             modified.sin_port = htons(g_port);
             inet_pton(AF_INET, g_ip.c_str(),
-                &modified.sin_addr);
+                      &modified.sin_addr);
         }
-        
+
         return real_connect(
             sockfd,
             reinterpret_cast<const sockaddr *>(&modified),
@@ -43,6 +46,49 @@ extern "C" int connect(int sockfd, const sockaddr *addr, socklen_t addrlen)
     }
 
     return real_connect(sockfd, addr, addrlen);
+}
+
+extern "C" hostent *gethostbyname(const char *name)
+{
+    static gethostbyname_fn real_gethostbyname =
+        (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
+
+    if (name && strcmp(name, "ms.jpxs.io") == 0)
+    {
+        printf("[hook] detected dns query, "
+               "redirecting to %s\n",
+               g_ip.c_str());
+
+        static hostent result{};
+        static in_addr addr{};
+        static char *addr_list[2]{};
+
+        if (inet_pton(AF_INET, g_ip.c_str(), &addr) != 1)
+        {
+            fprintf(stderr,
+                    "[hook] invalid IP for gethostbyname: %s\n",
+                    g_ip.c_str());
+
+            return real_gethostbyname(name);
+        }
+
+        addr_list[0] = reinterpret_cast<char *>(&addr);
+        addr_list[1] = nullptr;
+
+        result.h_name = const_cast<char *>("ms.jpxs.io");
+        result.h_aliases = nullptr;
+        result.h_addrtype = AF_INET;
+        result.h_length = sizeof(addr);
+        result.h_addr_list = addr_list;
+
+        fprintf(stderr,
+                "[hook] gethostbyname(%s) -> %s\n",
+                name, g_ip.c_str());
+
+        return &result;
+    }
+
+    return real_gethostbyname(name);
 }
 
 __attribute__((constructor)) static void init()

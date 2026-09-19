@@ -1,0 +1,7 @@
+{
+  "master_listen_ip": "127.0.0.1",
+  "master_listen_port": 27592,
+  "web_server_listen_ip": "127.0.0.1",
+  "web_server_listen_port": 8080,
+  "log_level": 0
+}

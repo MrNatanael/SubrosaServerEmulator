@@ -1,0 +1,15 @@
+services:
+  server:
+    image: mcr.microsoft.com/dotnet/sdk:10.0
+
+    working_dir: /src
+
+    volumes:
+      - ..:/src
+      - ./config.json:/src/config.json
+      
+    ports:
+      - "8080:8080"
+      - "27592:27592"
+
+    command: dotnet run --project src/SubrosaServerEmulator/SubrosaServerEmulator.csproj

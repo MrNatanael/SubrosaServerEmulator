@@ -192,11 +192,11 @@ public class MasterServer : LogSource, IDisposable
                 {
                     Username = req.Username,
                     RegistrationId = reader.GetInt32(0),
-                    RegistrationSeq = reader.GetInt32(1)
+                    Status = reader.GetInt32(1)
                 };
 
                 Debug($"Loaded client \"{user.Username}\" " +
-                      $"(ID: {user.RegistrationId}, {user.RegistrationSeq})");
+                      $"(ID: {user.RegistrationId}, {user.Status})");
             }
             else
             {
@@ -219,7 +219,7 @@ public class MasterServer : LogSource, IDisposable
                 {
                     Username = req.Username,
                     RegistrationId = id,
-                    RegistrationSeq = id
+                    Status = 1
                 };
 
                 using var insert = _db.CreateCommand();
@@ -233,12 +233,12 @@ public class MasterServer : LogSource, IDisposable
 
                 insert.Parameters.AddWithValue("$username", user.Username);
                 insert.Parameters.AddWithValue("$id", user.RegistrationId);
-                insert.Parameters.AddWithValue("$seq", user.RegistrationSeq);
+                insert.Parameters.AddWithValue("$seq", user.Status);
 
                 insert.ExecuteNonQuery();
 
                 Info($"Registered new client \"{user.Username}\" " +
-                     $"(ID: {user.RegistrationId}, {user.RegistrationSeq})");
+                     $"(ID: {user.RegistrationId}, {user.Status})");
             }
         }
 
@@ -251,7 +251,7 @@ public class MasterServer : LogSource, IDisposable
         {
             RegistrationId = user.RegistrationId,
             Field2 = 1,
-            RegistrationSeq = user.RegistrationSeq
+            RegistrationSeq = user.Status
         }, remote);
     }
 
@@ -260,7 +260,7 @@ public class MasterServer : LogSource, IDisposable
         if(!_userIdMap.TryGetValue(req.RegistrationId, out var user))
             throw new NotImplementedException();
         
-        Info($"Authenticated user \"{user.Username}\" (ID: {user.RegistrationId}, {user.RegistrationSeq})");
+        Info($"Authenticated user \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status})");
         SendPacket(new ClientAuthAckResPacket
         {
             Status = 1,
@@ -281,14 +281,14 @@ public class MasterServer : LogSource, IDisposable
         if(!_userIdMap.TryGetValue(req.RegistrationId, out var user))
             throw new NotImplementedException();
         
-        Info($"Player \"{user.Username}\" (ID: {user.RegistrationId}, {user.RegistrationSeq}) is joining a game...");
+        Info($"Player \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status}) is joining a game...");
         foreach (var server in _gameServers)
         {
             SendPacket(new RegisterClientReqPacket
             {
                 RegistrationId = user.RegistrationId,
                 Unknown = req.Unknown,
-                RegistrationSeq = user.RegistrationSeq,
+                RegistrationSeq = user.Status,
                 Username = user.Username
             }, server);
         }

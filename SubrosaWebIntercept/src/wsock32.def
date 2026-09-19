@@ -1,0 +1,25 @@
+LIBRARY WSOCK32
+
+EXPORTS
+    bind @2
+    closesocket @3
+    hooked_connect @4
+    getsockopt @7
+    htonl @8
+    htons @9
+    inet_addr @10
+    ioctlsocket @12
+    ntohl @14
+    ntohs @15
+    recv @16
+    recvfrom @17
+    select @18
+    send @19
+    sendto @20
+    socket @23
+    hooked_gethostbyname @52
+    hooked_getservbyname @55
+    hooked_gethostname @57
+    WSAStartup @115
+    WSACleanup @116
+    __WSAFDIsSet @151

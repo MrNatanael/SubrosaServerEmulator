@@ -192,7 +192,7 @@ public class MasterServer : LogSource, IDisposable
                 {
                     Username = req.Username,
                     RegistrationId = reader.GetInt32(0),
-                    Status = reader.GetInt32(1)
+                    Status = 1
                 };
 
                 Debug($"Loaded client \"{user.Username}\" " +
@@ -326,8 +326,7 @@ public class MasterServer : LogSource, IDisposable
         cmd.CommandText = """
                           CREATE TABLE IF NOT EXISTS users (
                               username TEXT PRIMARY KEY,
-                              registration_id INTEGER NOT NULL UNIQUE,
-                              registration_seq INTEGER NOT NULL
+                              registration_id INTEGER NOT NULL UNIQUE
                           );
                           """;
 

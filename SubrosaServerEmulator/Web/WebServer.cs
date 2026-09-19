@@ -59,7 +59,7 @@ public class WebServer(ServerSettings settings) : LogSource, IDisposable
         [
             "38", // Expected version
             "",
-            settings.MasterListenIP,
+            settings.MasterPublicIP,
             (settings.MasterListenPort - 2).ToString(),
             "", "", "",
             "", "", "", "",

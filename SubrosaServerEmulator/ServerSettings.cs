@@ -34,6 +34,7 @@ public class ServerSettings
     
     public string MasterListenIP { get; set; } = "127.0.0.1";
     public int MasterListenPort { get; set; } = 27592;
+    public string MasterPublicIP { get; set; } = "127.0.0.1";
     
     public string WebServerListenIP { get; set; } = "127.0.0.1";
     public int WebServerListenPort { get; set; } = 80;

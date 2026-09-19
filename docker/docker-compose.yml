@@ -12,4 +12,4 @@ services:
       - "8080:8080"
       - "27592:27592"
 
-    command: dotnet run --project src/SubrosaServerEmulator/SubrosaServerEmulator.csproj
+    command: dotnet run --project SubrosaServerEmulator/SubrosaServerEmulator.csproj

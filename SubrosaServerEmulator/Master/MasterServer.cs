@@ -1,14 +1,14 @@
-using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using Microsoft.Data.Sqlite;
 using SubrosaServerEmulator.Master.Data;
-using SubrosaServerEmulator.Master.Exceptions;
 using SubrosaServerEmulator.Master.IO;
 using SubrosaServerEmulator.Master.Packets;
-using Microsoft.Data.Sqlite;
 
 namespace SubrosaServerEmulator.Master;
+
 public class MasterServer : LogSource, IDisposable
 {
     public void Run(ServerSettings settings)
@@ -16,38 +16,37 @@ public class MasterServer : LogSource, IDisposable
         if (IsRunning) throw new InvalidOperationException("Instance already running.");
 
         Debug($"Binding to {settings.MasterListenIP}:{settings.MasterListenPort}");
-        
+
         Socket.Bind(new IPEndPoint(IPAddress.Parse(settings.MasterListenIP), settings.MasterListenPort));
         IsRunning = true;
-
-        _cts?.Dispose();
-        _cts = new CancellationTokenSource();
+        _lastPrune = Environment.TickCount64;
 
         Info($"Listening at {settings.MasterListenIP}:{settings.MasterListenPort}");
         ReceiveNext();
     }
+
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         IsRunning = false;
-        _cts?.Cancel();
+
+        AsyncArgs.Completed -= OnReceivePacket;
 
         Socket.Dispose();
         AsyncArgs.Dispose();
-        _cts?.Dispose();
-        
-        _gameServersMap.Clear();
-        _gameServers.Clear();
-        
-        _userNameMap.Clear();
-        _userIdMap.Clear();
+        _db.Dispose();
+
+        _gameServersByIp.Clear();
+        _gameServers = Array.Empty<IPEndPoint>();
+        _sessionsByName.Clear();
+        _sessionsById.Clear();
     }
-    
-    # region SERVER LOOP
+
     private void ReceiveNext()
     {
-        while (IsRunning && !_cts!.IsCancellationRequested)
+        while (IsRunning)
         {
-            Debug("Waiting next packet...");
             bool pending;
             try
             {
@@ -61,82 +60,75 @@ public class MasterServer : LogSource, IDisposable
             if (pending)
                 return;
 
-            Debug("Received packet synchronously");
-            HandleCompletedReceive(AsyncArgs); // Completed sync
+            if (!HandleCompletedReceive(AsyncArgs))
+                return;
         }
     }
+
     private void OnReceivePacket(object? sender, SocketAsyncEventArgs e)
     {
-        HandleCompletedReceive(e);
-
-        if (IsRunning && !_cts!.IsCancellationRequested)
+        if (HandleCompletedReceive(e))
             ReceiveNext();
     }
-
-    private void HandleCompletedReceive(SocketAsyncEventArgs e)
+    private bool HandleCompletedReceive(SocketAsyncEventArgs e)
     {
-        if (e.SocketError != SocketError.Success)
+        if (!IsRunning) return false;
+
+        switch (e.SocketError)
         {
-            Warning($"Master Server");
-            return;
+            case SocketError.Success:
+                _consecutiveReceiveErrors = 0;
+                break;
+
+            case SocketError.OperationAborted:
+            case SocketError.Shutdown:
+            case SocketError.NotSocket:
+            case SocketError.Interrupted:
+                return false;
+
+            case SocketError.ConnectionReset:
+                return true;
+
+            default:
+                Warning($"Receive failed: {e.SocketError}");
+                
+                if (++_consecutiveReceiveErrors >= MaxConsecutiveReceiveErrors)
+                {
+                    Error($"Too many consecutive receive errors, stopping ({e.SocketError})");
+                    IsRunning = false;
+                    return false;
+                }
+
+                return true;
         }
 
         if (e.BytesTransferred <= 0 || e.RemoteEndPoint is not IPEndPoint remote)
-            return;
+            return true;
 
-        ReadOnlySpan<byte> packet = e.Buffer.AsSpan(e.Offset, e.BytesTransferred);
         try
         {
-            ProcessPacket(packet, remote);
-        }
-        catch (InvalidSignatureException)
-        {
-            Debug("Received packet with invalid signature");
-        }
-        catch (UnknownPacketException unk)
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine($"Received unknown packet 0x{unk.Type:X2}");
-            if (packet.Length > 0x05)
-            {
-                sb.AppendLine($"\t> PACKET DUMP");
-                sb.Append('\t');
-
-                for (int i = 0x05; i < packet.Length; i++)
-                {
-                    var offset = i - 0x05;
-                    if (offset > 0)
-                    {
-                        if (offset % 16 == 0x00)
-                        {
-                            sb.AppendLine();
-                            sb.Append('\t');
-                        }
-                        else if (offset % 4 == 0x00) sb.Append("  ");
-                    }
-
-                    sb.Append($"{i:X2} ");
-                }
-            }
-
-            Warning(sb.ToString());
+            ProcessPacket(e.Buffer.AsSpan(e.Offset, e.BytesTransferred), remote);
         }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine(ex);
             Error(ex.Message);
         }
+
+        return true;
     }
+
     private void ProcessPacket(ReadOnlySpan<byte> data, IPEndPoint remote)
     {
-        Debug($"Received {data.Length} bytes from {remote}");
+        if (data.Length < HeaderSize)
+            return;
+
         using var stream = new PacketStream(data);
 
         if (stream.ReadI32() != PacketStream.SIGNATURE)
-            throw new InvalidSignatureException();
+            return;
 
         var type = stream.ReadU8();
-        Debug($"Handling packet 0x{type:X2} ({(PacketType)type})");
         switch ((PacketType)type)
         {
             case PacketType.GameServerPing: OnGameServerPing(CreatePacket<GameServerPingPacket>(stream), remote); break;
@@ -144,109 +136,121 @@ public class MasterServer : LogSource, IDisposable
             case PacketType.ClientAuthAck: OnClientAuthAck(CreatePacket<ClientAuthAckReqPacket>(stream), remote); break;
             case PacketType.ServerList: OnListServers(CreatePacket<ClientServerListReqPacket>(stream), remote); break;
             case PacketType.ClientConnect: OnConnect(CreatePacket<ClientConnectReqPacket>(stream), remote); break;
-            default: throw new UnknownPacketException(type);
+            default: LogUnknownPacket(type, data); break;
         }
+
+        PruneIfDue(Environment.TickCount64);
     }
-    #endregion
-    
-    #region PACKET HANDLERS
-    void OnGameServerPing(GameServerPingPacket _, EndPoint remote)
+
+    private void LogUnknownPacket(int type, ReadOnlySpan<byte> packet)
     {
-        if(remote is not IPEndPoint ep)
+        var sb = new StringBuilder();
+        sb.AppendLine($"Received unknown packet 0x{type:X2}");
+
+        if (packet.Length > HeaderSize)
         {
-            Warning("Invalid remote endpoint type");
+            sb.AppendLine("\t> PACKET DUMP");
+            sb.Append('\t');
+
+            for (int i = HeaderSize; i < packet.Length; i++)
+            {
+                var offset = i - HeaderSize;
+                if (offset > 0)
+                {
+                    if (offset % 16 == 0)
+                    {
+                        sb.AppendLine();
+                        sb.Append('\t');
+                    }
+                    else if (offset % 4 == 0) sb.Append("  ");
+                }
+
+                sb.Append($"{packet[i]:X2} "); // was {i:X2} (printed the index, not the byte)
+            }
+        }
+
+        Warning(sb.ToString());
+    }
+
+    private void PruneIfDue(long now)
+    {
+        if (now - _lastPrune < PruneIntervalMs) return;
+        _lastPrune = now;
+
+        var serversChanged = false;
+        foreach (var (ip, entry) in _gameServersByIp)
+        {
+            if (now - entry.LastSeen <= GameServerTimeoutMs) continue;
+
+            _gameServersByIp.Remove(ip);
+            serversChanged = true;
+            Info($"Game server {entry.EndPoint} timed out");
+        }
+
+        if (serversChanged)
+            PublishGameServers();
+
+        var evicted = 0;
+        foreach (var (id, session) in _sessionsById)
+        {
+            if (now - session.LastSeen <= SessionTimeoutMs) continue;
+
+            _sessionsById.TryRemove(id, out _);
+            _sessionsByName.TryRemove(session.User.Username, out _);
+            evicted++;
+        }
+
+        if (evicted > 0)
+            Debug($"Evicted {evicted} idle user session(s)");
+    }
+
+    private void PublishGameServers()
+    {
+        var snapshot = new IPEndPoint[_gameServersByIp.Count];
+        var i = 0;
+        foreach (var entry in _gameServersByIp.Values)
+            snapshot[i++] = entry.EndPoint;
+
+        _gameServers = snapshot;
+    }
+    
+    void OnGameServerPing(GameServerPingPacket _, IPEndPoint remote)
+    {
+        var now = Environment.TickCount64;
+
+        if (_gameServersByIp.TryGetValue(remote.Address, out var entry))
+        {
+            entry.LastSeen = now;
+
+            if (!entry.EndPoint.Equals(remote))
+            {
+                Info($"Game server {entry.EndPoint} moved to {remote}");
+                entry.EndPoint = remote;
+                PublishGameServers();
+            }
+
             return;
         }
 
-        var id = BinaryPrimitives.ReadInt32LittleEndian(ep.Address.GetAddressBytes());
-        if(_gameServersMap.Add(id))
-        {
-            Info($"Registered new game server {ep.Address}:{ep.Port}");
-            _gameServers.Add(ep);
-
-             
-        }
+        _gameServersByIp[remote.Address] = new GameServerEntry(remote, now);
+        PublishGameServers();
+        Info($"Registered new game server {remote.Address}:{remote.Port}");
     }
+
     void OnClientAuth(ClientAuthReqPacket req, EndPoint remote)
     {
-        User user;
+        var now = Environment.TickCount64;
 
-        using var transaction = _db.BeginTransaction();
-
-        using (var cmd = _db.CreateCommand())
+        if (_sessionsByName.TryGetValue(req.Username, out var session))
         {
-            cmd.Transaction = transaction;
-            cmd.CommandText = """
-                              SELECT registration_id, registration_seq
-                              FROM users
-                              WHERE username = $username;
-                              """;
-
-            cmd.Parameters.AddWithValue("$username", req.Username);
-
-            using var reader = cmd.ExecuteReader();
-
-            if (reader.Read())
-            {
-                user = new User
-                {
-                    Username = req.Username,
-                    RegistrationId = reader.GetInt32(0),
-                    Status = 1
-                };
-
-                Debug($"Loaded client \"{user.Username}\" " +
-                      $"(ID: {user.RegistrationId}, {user.Status})");
-            }
-            else
-            {
-                reader.Close();
-
-                int id;
-
-                using (var idCmd = _db.CreateCommand())
-                {
-                    idCmd.Transaction = transaction;
-                    idCmd.CommandText = """
-                                        SELECT COALESCE(MAX(registration_id), 0) + 1
-                                        FROM users;
-                                        """;
-
-                    id = Convert.ToInt32(idCmd.ExecuteScalar());
-                }
-
-                user = new User
-                {
-                    Username = req.Username,
-                    RegistrationId = id,
-                    Status = 1
-                };
-
-                using var insert = _db.CreateCommand();
-                insert.Transaction = transaction;
-                insert.CommandText = """
-                                     INSERT INTO users
-                                         (username, registration_id, registration_seq)
-                                     VALUES
-                                         ($username, $id, $seq);
-                                     """;
-
-                insert.Parameters.AddWithValue("$username", user.Username);
-                insert.Parameters.AddWithValue("$id", user.RegistrationId);
-                insert.Parameters.AddWithValue("$seq", user.Status);
-
-                insert.ExecuteNonQuery();
-
-                Info($"Registered new client \"{user.Username}\" " +
-                     $"(ID: {user.RegistrationId}, {user.Status})");
-            }
+            session.LastSeen = now;
+        }
+        else
+        {
+            session = CacheSession(LoadOrRegisterUser(req.Username), now);
         }
 
-        transaction.Commit();
-
-        _userNameMap[user.Username] = user;
-        _userIdMap[user.RegistrationId] = user;
-
+        var user = session.User;
         SendPacket(new ClientAuthResPacket
         {
             RegistrationId = user.RegistrationId,
@@ -257,9 +261,12 @@ public class MasterServer : LogSource, IDisposable
 
     void OnClientAuthAck(ClientAuthAckReqPacket req, EndPoint remote)
     {
-        if(!_userIdMap.TryGetValue(req.RegistrationId, out var user))
-            throw new NotImplementedException();
-        
+        if (!TryGetUser(req.RegistrationId, Environment.TickCount64, out var user))
+        {
+            Warning($"Auth ack for unknown registration ID {req.RegistrationId}");
+            return;
+        }
+
         Info($"Authenticated user \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status})");
         SendPacket(new ClientAuthAckResPacket
         {
@@ -272,25 +279,33 @@ public class MasterServer : LogSource, IDisposable
     {
         SendPacket(new ClientServerListResPacket
         {
-            EndPointArray = _gameServers.ToArray() 
+            EndPointArray = _gameServers
         }, remote);
     }
 
     void OnConnect(ClientConnectReqPacket req, EndPoint remote)
     {
-        if(!_userIdMap.TryGetValue(req.RegistrationId, out var user))
-            throw new NotImplementedException();
-        
-        Info($"Player \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status}) is joining a game...");
-        foreach (var server in _gameServers)
+        if (!TryGetUser(req.RegistrationId, Environment.TickCount64, out var user))
         {
-            SendPacket(new RegisterClientReqPacket
+            Warning($"Connect request for unknown registration ID {req.RegistrationId}");
+            return;
+        }
+
+        Info($"Player \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status}) is joining a game...");
+
+        var servers = _gameServers;
+        if (servers.Length > 0)
+        {
+            var payload = Serialize(new RegisterClientReqPacket
             {
-                RegistrationId = user.RegistrationId,
-                Unknown = req.Unknown,
-                RegistrationSeq = user.Status,
+                Unknown1 = user.RegistrationId,
+                UserRegistrationId = user.RegistrationId,
+                UserStatus = user.Status,
                 Username = user.Username
-            }, server);
+            });
+
+            foreach (var server in servers)
+                SendRaw(payload, server);
         }
 
         SendPacket(new ClientConnectResPacket
@@ -298,7 +313,93 @@ public class MasterServer : LogSource, IDisposable
             Unknown = req.Unknown,
         }, remote);
     }
-    #endregion
+
+    private Session CacheSession(User user, long now)
+    {
+        var session = new Session(user, now);
+        _sessionsByName[user.Username] = session;
+        _sessionsById[user.RegistrationId] = session;
+        return session;
+    }
+
+    private bool TryGetUser(int registrationId, long now, out User user)
+    {
+        if (_sessionsById.TryGetValue(registrationId, out var session))
+        {
+            session.LastSeen = now;
+            user = session.User;
+            return true;
+        }
+
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT username FROM users WHERE registration_id = $id;";
+        cmd.Parameters.AddWithValue("$id", registrationId);
+
+        if (cmd.ExecuteScalar() is string username)
+        {
+            user = CacheSession(new User
+            {
+                Username = username,
+                RegistrationId = registrationId,
+                Status = DefaultStatus
+            }, now).User;
+            return true;
+        }
+
+        user = null!;
+        return false;
+    }
+
+    private User LoadOrRegisterUser(string username)
+    {
+        using (var select = _db.CreateCommand())
+        {
+            select.CommandText = "SELECT registration_id FROM users WHERE username = $username;";
+            select.Parameters.AddWithValue("$username", username);
+
+            if (select.ExecuteScalar() is { } existing)
+            {
+                var loaded = new User
+                {
+                    Username = username,
+                    RegistrationId = Convert.ToInt32(existing),
+                    Status = DefaultStatus
+                };
+
+                Debug($"Loaded client \"{loaded.Username}\" (ID: {loaded.RegistrationId}, {loaded.Status})");
+                return loaded;
+            }
+        }
+
+        using var transaction = _db.BeginTransaction();
+
+        int id;
+        using (var idCmd = _db.CreateCommand())
+        {
+            idCmd.Transaction = transaction;
+            idCmd.CommandText = "SELECT COALESCE(MAX(registration_id), 0) + 1 FROM users;";
+            id = Convert.ToInt32(idCmd.ExecuteScalar());
+        }
+
+        using (var insert = _db.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                                 INSERT INTO users (username, registration_id, registration_seq)
+                                 VALUES ($username, $id, $seq);
+                                 """;
+            insert.Parameters.AddWithValue("$username", username);
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$seq", DefaultStatus);
+            insert.ExecuteNonQuery();
+        }
+
+        transaction.Commit();
+
+        var user = new User { Username = username, RegistrationId = id, Status = DefaultStatus };
+        Info($"Registered new client \"{user.Username}\" (ID: {user.RegistrationId}, {user.Status})");
+        return user;
+    }
     
     T CreatePacket<T>(PacketStream stream) where T : IPacket, new()
     {
@@ -308,56 +409,130 @@ public class MasterServer : LogSource, IDisposable
         return packet;
     }
 
-    void SendPacket(IPacket pck, EndPoint remote)
+    private static byte[] Serialize(IPacket pck)
     {
         using var stream = new PacketStream();
         stream.WriteI32(PacketStream.SIGNATURE);
         stream.WriteU8((byte)pck.Type);
-        
+
         pck.Write(stream);
-        Socket.SendTo(stream.ToArray(), remote);
+        return stream.ToArray();
     }
 
+    void SendPacket(IPacket pck, EndPoint remote) => SendRaw(Serialize(pck), remote);
+
+    private void SendRaw(byte[] payload, EndPoint remote)
+    {
+        try
+        {
+            Socket.SendTo(payload, remote);
+        }
+        catch (SocketException ex)
+        {
+            Warning($"Send to {remote} failed: {ex.SocketErrorCode}");
+        }
+        catch (ObjectDisposedException)
+        {
+            
+        }
+    }
+    
     void InitDB()
     {
         _db.Open();
 
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = """
-                          CREATE TABLE IF NOT EXISTS users (
-                              username TEXT PRIMARY KEY,
-                              registration_id INTEGER NOT NULL UNIQUE
-                          );
-                          """;
+        using (var cmd = _db.CreateCommand())
+        {
+            cmd.CommandText = """
+                              CREATE TABLE IF NOT EXISTS users (
+                                  username TEXT PRIMARY KEY,
+                                  registration_id INTEGER NOT NULL UNIQUE,
+                                  registration_seq INTEGER NOT NULL DEFAULT 1
+                              );
+                              """;
+            cmd.ExecuteNonQuery();
+        }
 
-        cmd.ExecuteNonQuery();
+        // The original CREATE TABLE had no registration_seq column even though the queries used it.
+        // Add it to databases created by that version (no-op if it already exists).
+        bool hasSeq;
+        using (var check = _db.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'registration_seq';";
+            hasSeq = Convert.ToInt32(check.ExecuteScalar()) > 0;
+        }
+
+        if (!hasSeq)
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE users ADD COLUMN registration_seq INTEGER NOT NULL DEFAULT 1;";
+            alter.ExecuteNonQuery();
+        }
     }
-    
+
     public MasterServer()
     {
+        if (OperatingSystem.IsWindows())
+        {
+            const int SIO_UDP_CONNRESET = -1744830452;
+            Socket.IOControl(SIO_UDP_CONNRESET, [0], null);
+        }
+
         AsyncArgs.Completed += OnReceivePacket;
         AsyncArgs.RemoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
         AsyncArgs.SetBuffer(new byte[1024], 0, 1024);
 
         InitDB();
     }
+    
+    public bool IsRunning
+    {
+        get => _isRunning;
+        private set => _isRunning = value;
+    }
 
-    public bool IsRunning { get; private set; }
     public IReadOnlyList<IPEndPoint> GameServers => _gameServers;
     
-    public int UserCount => _userNameMap.Count;
-    public IEnumerable<User> Users => _userNameMap.Values;
+    public int UserCount => _sessionsById.Count;
+    public IEnumerable<User> Users => _sessionsById.Values.Select(s => s.User);
 
     protected override string SourceName => "Master Server";
     private Socket Socket { get; } = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-    
-    private readonly List<IPEndPoint> _gameServers = new();
-    private readonly HashSet<int> _gameServersMap = new();
 
-    private readonly Dictionary<string, User> _userNameMap = new();
-    private readonly Dictionary<int, User> _userIdMap = new();
-    readonly SqliteConnection _db = new("Data Source=master.db");
-    
+    private sealed class GameServerEntry(IPEndPoint endPoint, long lastSeen)
+    {
+        public IPEndPoint EndPoint = endPoint;
+        public long LastSeen = lastSeen;
+    }
+
+    private sealed class Session(User user, long lastSeen)
+    {
+        public readonly User User = user;
+        public long LastSeen = lastSeen;
+    }
+
+    private readonly Dictionary<IPAddress, GameServerEntry> _gameServersByIp = new();
+    private volatile IPEndPoint[] _gameServers = Array.Empty<IPEndPoint>();
+
+    private readonly ConcurrentDictionary<string, Session> _sessionsByName = new();
+    private readonly ConcurrentDictionary<int, Session> _sessionsById = new();
+
+    private readonly SqliteConnection _db = new("Data Source=master.db;Pooling=False");
+
     private SocketAsyncEventArgs AsyncArgs { get; } = new();
-    private CancellationTokenSource? _cts;
+
+    private volatile bool _isRunning;
+    private bool _disposed;
+    private long _lastPrune;
+    private int _consecutiveReceiveErrors;
+    
+    private const long GameServerTimeoutMs = 2 * 60 * 1000;
+    
+    private const long SessionTimeoutMs = 30 * 60 * 1000;
+
+    private const long PruneIntervalMs = 30 * 1000;
+
+    private const int MaxConsecutiveReceiveErrors = 100;
+    private const int HeaderSize = 5;
+    private const int DefaultStatus = 1;
 }

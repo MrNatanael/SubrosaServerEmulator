@@ -2,6 +2,8 @@
 
 This project allows you to host your own master server for Subrosa.
 
+[![Ko-Fi](https://badgen.net/badge/icon/Ko-fi?icon=kofi&label=Support)](https://ko-fi.com/natanm)
+
 **Keep in mind that this is W.I.P. and may fail in some cases.**
 
 > [!WARNING]

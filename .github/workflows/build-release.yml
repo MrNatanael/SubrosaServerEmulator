@@ -60,6 +60,41 @@ jobs:
           echo "=== Intercept ==="
           find build/bin/libs -type f -print 2>/dev/null || true
 
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+
+          if [ -d build/bin/Master/linux-x64 ]; then
+            find build/bin/Master/linux-x64 -type f | while read -r file; do
+              name=$(basename "$file")
+
+              if [[ "$name" == *.pdb ]]; then
+                cp "$file" "release-assets/${name%.pdb}-linux-x64.pdb"
+              else
+                cp "$file" "release-assets/$name"
+              fi
+            done
+          fi
+
+          if [ -d build/bin/Master/win-x64 ]; then
+            find build/bin/Master/win-x64 -type f | while read -r file; do
+              name=$(basename "$file")
+
+              if [[ "$name" == *.pdb ]]; then
+                cp "$file" "release-assets/${name%.pdb}-win-x64.pdb"
+              else
+                cp "$file" "release-assets/$name"
+              fi
+            done
+          fi
+
+          if [ -d build/bin/libs ]; then
+            find build/bin/libs -type f -exec cp {} release-assets/ \;
+          fi
+
+          echo "=== Release assets ==="
+          ls -lh release-assets
+
       - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,8 +104,4 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            $(find \
-              build/bin/Master/linux-x64 \
-              build/bin/Master/win-x64 \
-              build/bin/libs \
-              -type f 2>/dev/null)
+            release-assets/*

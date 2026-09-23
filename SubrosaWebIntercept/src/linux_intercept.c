@@ -53,11 +53,11 @@ extern "C" hostent *gethostbyname(const char *name)
     static gethostbyname_fn real_gethostbyname =
         (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
 
-    if (name && strcmp(name, "ms.jpxs.io") == 0)
+    if (name)
     {
         printf("[hook] detected dns query, "
-               "redirecting to %s\n",
-               g_ip.c_str());
+               "redirecting from \"%s\" to \"%s\"\n",
+               name, g_ip.c_str());
 
         static hostent result{};
         static in_addr addr{};
@@ -75,16 +75,12 @@ extern "C" hostent *gethostbyname(const char *name)
         addr_list[0] = reinterpret_cast<char *>(&addr);
         addr_list[1] = nullptr;
 
-        result.h_name = const_cast<char *>("ms.jpxs.io");
+        result.h_name = const_cast<char *>(name);
         result.h_aliases = nullptr;
         result.h_addrtype = AF_INET;
         result.h_length = sizeof(addr);
         result.h_addr_list = addr_list;
-
-        fprintf(stderr,
-                "[hook] gethostbyname(%s) -> %s\n",
-                name, g_ip.c_str());
-
+        
         return &result;
     }
 
